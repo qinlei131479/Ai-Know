@@ -2,7 +2,7 @@
 import { ref, reactive, onMounted, computed, provide } from 'vue'
 import { RouterLink, RouterView, useRoute } from 'vue-router'
 import { GithubOutlined } from '@ant-design/icons-vue'
-import { Bot, Waypoints, LibraryBig, BarChart3, CircleCheck } from 'lucide-vue-next'
+import { Bot, Waypoints, LibraryBig, BarChart3, CircleCheck, Database, MessageSquareMore } from 'lucide-vue-next'
 
 import { useConfigStore } from '@/stores/config'
 import { useDatabaseStore } from '@/stores/database'
@@ -106,6 +106,18 @@ const mainList = [
     activeIcon: LibraryBig
   },
   {
+    name: '数据问答',
+    path: '/data-chat',
+    icon: MessageSquareMore,
+    activeIcon: MessageSquareMore
+  },
+  {
+    name: '数据源',
+    path: '/datasource',
+    icon: Database,
+    activeIcon: Database
+  },
+  {
     name: 'Dashboard',
     path: '/dashboard',
     icon: BarChart3,
@@ -181,12 +193,14 @@ provide('settingsModal', {
         <UserInfoComponent />
       </div>
     </div>
-    <router-view v-slot="{ Component, route }" id="app-router-view">
-      <keep-alive v-if="route.meta.keepAlive !== false">
-        <component :is="Component" />
-      </keep-alive>
-      <component :is="Component" v-else />
-    </router-view>
+    <div id="app-router-view">
+      <router-view v-slot="{ Component, route }">
+        <keep-alive v-if="route.meta.keepAlive !== false">
+          <component :is="Component" />
+        </keep-alive>
+        <component :is="Component" v-else :key="route.fullPath" />
+      </router-view>
+    </div>
 
     <!-- Debug Modal -->
     <a-modal
@@ -228,6 +242,16 @@ div.header,
 #app-router-view {
   flex: 1 1 auto;
   overflow-y: auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+
+  :deep(> *) {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
 }
 
 .header {

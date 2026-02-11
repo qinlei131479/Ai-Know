@@ -10,6 +10,7 @@ from sqlalchemy.orm import declarative_base
 
 from server.utils.singleton import SingletonMeta
 from src.storage.postgres.models_business import Base as BusinessBase
+import src.storage.postgres.models_datasource  # noqa: F401 - 确保数据源模型注册到 BusinessBase.metadata
 from src.storage.postgres.models_knowledge import Base as KnowledgeBase
 from src.utils import logger
 

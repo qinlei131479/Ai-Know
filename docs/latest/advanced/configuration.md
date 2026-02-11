@@ -80,6 +80,10 @@ class ChatModelProvider(BaseModel):
 # NEW_PROVIDER_API_KEY=your_api_key
 
 # 3. 重启服务或重新加载配置
+
+# 数据源加密密钥（用于加密外部数据库连接配置）
+# DATASOURCE_ENCRYPT_KEY=<Fernet key>
+# 生成: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
 ## 配置管理特性

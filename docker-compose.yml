@@ -38,6 +38,7 @@ services:
       - MINIO_URI=${MINIO_URI:-http://milvus-minio:9000}
       - MODEL_DIR_IN_DOCKER=/models
       - RUNNING_IN_DOCKER=true
+      - DATASOURCE_ENCRYPT_KEY=${DATASOURCE_ENCRYPT_KEY:-}
       - NO_PROXY=localhost,127.0.0.1,milvus,graph,milvus-minio,milvus-etcd-dev,etcd,minio,mineru,paddlex,api.siliconflow.cn
       - no_proxy=localhost,127.0.0.1,milvus,graph,milvus-minio,milvus-etcd-dev,etcd,minio,mineru,paddlex,api.siliconflow.cn
     # endregion api_envs
@@ -184,7 +185,7 @@ services:
     image: postgres:16
     container_name: postgres
     ports:
-      - "5432:5432"
+      - "25432:5432"
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}

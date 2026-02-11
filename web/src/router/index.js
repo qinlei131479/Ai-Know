@@ -78,6 +78,38 @@ const router = createRouter({
       ]
     },
     {
+      path: '/data-chat',
+      name: 'dataChat',
+      component: AppLayout,
+      children: [
+        {
+          path: '',
+          name: 'DataChatComp',
+          component: () => import('../views/DataChatView.vue'),
+          meta: { keepAlive: false, requiresAuth: true, requiresAdmin: true }
+        }
+      ]
+    },
+    {
+      path: '/datasource',
+      name: 'datasource',
+      component: AppLayout,
+      children: [
+        {
+          path: '',
+          name: 'DatasourceComp',
+          component: () => import('../views/DatasourceView.vue'),
+          meta: { keepAlive: true, requiresAuth: true, requiresAdmin: true }
+        },
+        {
+          path: ':ds_id',
+          name: 'DatasourceDetailComp',
+          component: () => import('../views/DatasourceDetailView.vue'),
+          meta: { keepAlive: false, requiresAuth: true, requiresAdmin: true }
+        }
+      ]
+    },
+    {
       path: '/dashboard',
       name: 'dashboard',
       component: AppLayout,
