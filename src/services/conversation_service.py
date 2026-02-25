@@ -2,6 +2,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import HTTPException, UploadFile
+from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agents import agent_manager
@@ -78,26 +79,34 @@ async def _sync_thread_attachment_state(
 
         graph = await agent.get_graph()
         config = {"configurable": {"thread_id": thread_id, "user_id": str(user_id)}}
+
+        # 先获取现有 state，保留非附件文件
         state = await graph.aget_state(config)
         state_values = getattr(state, "values", {}) if state else {}
         existing_files = state_values.get("files", {}) if isinstance(state_values, dict) else {}
         if not isinstance(existing_files, dict):
             existing_files = {}
 
-        attachment_files = _build_state_files(attachments)
+        # 保留非 /attachments/ 开头的现有文件（如 Agent 创建的 a.md）
         merged_files = {
             path: file_data
             for path, file_data in existing_files.items()
             if isinstance(path, str) and not path.startswith("/attachments/")
         }
+
+        # 添加附件文件
+        attachment_files = _build_state_files(attachments)
         merged_files.update(attachment_files)
 
+        # 使用 Command 确保 reducer 被正确应用
         await graph.aupdate_state(
             config=config,
-            values={
-                "attachments": attachments,
-                "files": merged_files,
-            },
+            values=Command(
+                update={
+                    "attachments": attachments,
+                    "files": merged_files,
+                }
+            ),
         )
     except Exception as e:
         logger.warning(f"Failed to sync attachment state for thread {thread_id}: {e}")
@@ -260,7 +269,7 @@ async def upload_thread_attachment_view(
         "uploaded_at": utc_isoformat(),
         "truncated": conversion.truncated,
         "file_path": file_path,  # 用于 StateBackend，前端不返回此字段
-        "minio_url": minio_url,
+        "minio_url": minio_url,  # 暂未使用
     }
     await conv_repo.add_attachment(conversation.id, attachment_record)
     all_attachments = await conv_repo.get_attachments(conversation.id)
