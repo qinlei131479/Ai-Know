@@ -817,10 +817,8 @@ const stopResize = () => {
   min-height: 300px;
   max-height: 60vh;
   overflow-y: auto;
-  background: var(--main-5);
   border-radius: 6px;
   padding: 16px;
-  border: 1px solid var(--gray-200);
 
   &::-webkit-scrollbar {
     width: 8px;
