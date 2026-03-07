@@ -25,7 +25,7 @@
 [硅基流动](https://cloud.siliconflow.cn/i/Eo5yTHGJ) 注册即送 14 元额度，支持多种开源模型。
 :::
 
-<<< @/../.env.template#model_provider{bash 5}
+<<< @/../../.env.template#model_provider{bash 5}
 
 ### 默认对话模型格式
 

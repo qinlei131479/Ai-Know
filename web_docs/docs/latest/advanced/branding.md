@@ -14,11 +14,11 @@ cp src/config/static/info.template.yaml src/config/static/info.local.yaml
 
 在 `src/config/static/info.local.yaml` 中配置：
 
-<<< @/../src/config/static/info.template.yaml
+<<< @/../../src/config/static/info.template.yaml
 
 上述中提到的 ICON 预设了下面这些，如果需要更多的 ICONS，可以手动从 `lucide-vue-next` 中引入。
 
-<<< @/../web/src/views/HomeView.vue#icon_mapping{js}
+<<< @/../../web/src/views/HomeView.vue#icon_mapping{js}
 
 ### 3. 环境变量配置
 

@@ -10,19 +10,18 @@
 
 ### 安装步骤
 
-项目采用微服务架构，默认服务无需 GPU 支持。GPU 仅用于可选的 OCR 服务，可通过环境变量配置外部服务。
+项目采用微服务架构，核心服务无需 GPU 支持。GPU 仅用于可选的 OCR 服务和本地模型推理，可通过环境变量配置外部服务。
 
 #### 1. 获取项目代码
 
 ```bash
 # 克隆稳定版本
-git clone --branch v0.5.0-beta4 --depth 1 https://github.com/xerrors/Yuxi-Know.git
+git clone --branch v0.4.0 --depth 1 https://github.com/xerrors/Yuxi-Know.git
 cd Yuxi-Know
 ```
 
 ::: warning 版本说明
-- `v0.4.4`: 稳定版本
-- `v0.5.0-beta4`: 由于数据库重构使用 postgres，可能会存在数据库迁移问题，建议新用户使用，迁移指南详见 [迁移指南](https://xerrors.github.io/Yuxi-Know/latest/changelog/migrate_to_v0-5)。
+- `v0.4.0`: 稳定版本
 - `main`: 最新开发版本（不稳定，新特性可能会导致新 bug）
 :::
 
@@ -62,7 +61,7 @@ cp .env.template .env
 编辑 `.env` 文件，配置必需的 API 密钥，这里强烈建议先使用硅基流动的 API 和模型（DeepSeek）验证平台的功能无误后，再尝试切换到自己的模型：
 
 
-<<< @/../.env.template#model_provider{bash 5}
+<<< @/../../.env.template#model_provider{bash 5}
 
 
 ::: tip 免费获取 API Key
@@ -78,8 +77,6 @@ docker compose up --build
 # 后台运行（推荐）
 docker compose up --build -d
 ```
-
-**注意**：启动后，可能还需要一些时间，尤其是后端服务需要一段时间，请耐心等待 2-3 分钟。
 
 #### 4. 访问系统
 
@@ -105,10 +102,6 @@ docker compose down
 
 
 ## 故障排除
-
-::: tip 调试面板
-前端有个**调试面板**，在头像选项里，生产环境建议删除此特性。
-:::
 
 #### 查看服务状态
 
@@ -141,7 +134,7 @@ powershell -ExecutionPolicy Bypass -File docker/pull_image.ps1 python:3.12-slim
 **离线镜像拉取方案**：
 
 ```bash
-# 在有网络的环境保存镜像（镜像名称需要确认是否和实际一致，现有版本可能不是最新最全，需要检查）
+# 在有网络的环境保存镜像（镜像名称需要确认是否和实际一致）
 bash docker/save_docker_images.sh  # Linux/macOS
 powershell -ExecutionPolicy Bypass -File docker/save_docker_images.ps1  # Windows
 
@@ -170,10 +163,6 @@ $env:HTTPS_PROXY="http://IP:PORT"
 ```
 
 如果已配置代理但构建失败，尝试移除代理后重试。
-
-如果出现，FetchError: request to https://registry.npmjs.org/npm failed, reason: connect ECONNREFUSED 127.0.0.1:7890
-
-新建一个终端重新执行，并确保没有代理干扰。
 
 </details>
 
