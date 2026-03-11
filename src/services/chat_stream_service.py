@@ -304,10 +304,20 @@ async def stream_agent_chat(
 
     messages = [human_message]
 
-    user_id = str(current_user.id)
-    department_id = current_user.department_id
-    if not department_id:
-        yield make_chunk(status="error", error_type="no_department", error_message="当前用户未绑定部门", meta=meta)
+    # 兼容字符串和对象类型的 current_user
+    if isinstance(current_user, str):
+        user_id = current_user
+        department_id = None
+    else:
+        user_id = str(current_user.id)
+        department_id = current_user.department_id
+        if not department_id:
+            yield make_chunk(status="error", error_type="no_department", error_message="当前用户未绑定部门", meta=meta)
+            return
+
+    # 当 department_id 为 None 时，无法获取 agent config，返回错误
+    if department_id is None:
+        yield make_chunk(status="error", error_type="no_department", error_message="无法获取用户部门信息", meta=meta)
         return
 
     agent_config_id = config.get("agent_config_id")
@@ -529,11 +539,23 @@ async def stream_agent_resume(
     resume_command = Command(resume=approved)
     graph = await agent.get_graph()
 
-    user_id = str(current_user.id)
-    department_id = current_user.department_id
-    if not department_id:
+    # 兼容字符串和对象类型的 current_user
+    if isinstance(current_user, str):
+        user_id = current_user
+        department_id = None
+    else:
+        user_id = str(current_user.id)
+        department_id = current_user.department_id
+        if not department_id:
+            yield make_resume_chunk(
+                status="error", error_type="no_department", error_message="当前用户未绑定部门", meta=meta
+            )
+            return
+
+    # 当 department_id 为 None 时，无法获取 agent config，返回错误
+    if department_id is None:
         yield make_resume_chunk(
-            status="error", error_type="no_department", error_message="当前用户未绑定部门", meta=meta
+            status="error", error_type="no_department", error_message="无法获取用户部门信息", meta=meta
         )
         return
 
@@ -670,3 +692,388 @@ async def get_agent_state_view(
             logger.warning(f"Failed to fetch attachments for thread {thread_id}: {e}")
 
     return {"agent_state": agent_state}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 统一对话服务 - 支持多种问答模式
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _sse(data_type: str, data: dict) -> str:
+    """构建 SSE 消息"""
+    return "data:" + json.dumps({"dataType": data_type, "data": data}, ensure_ascii=False) + "\n\n"
+
+
+def _agent_jsonl_bytes_to_sse(raw_line: bytes) -> bytes | None:
+    """将 stream_agent_chat 输出的 JSONL 转成 DataChatView 兼容的 SSE。
+
+    stream_agent_chat 当前输出：一行一个 JSON（以 \\n 结尾），不带 data: 前缀。
+    DataChatView 只解析以 data: 开头的 SSE 行，因此需要在这里做适配。
+    """
+    try:
+        payload = json.loads(raw_line.decode("utf-8").strip())
+    except Exception:
+        return None
+
+    status = payload.get("status")
+
+    # 1) 正常流式增量 token（AIMessageChunk）会落在 response 字段里
+    if status == "loading":
+        delta = payload.get("response")
+        if delta is None:
+            return None
+        if isinstance(delta, list):
+            delta = "".join(str(x) for x in delta)
+        return _sse("answer", {"content": str(delta)}).encode("utf-8")
+
+    # 2) 错误/中断（保持和前端约定：answer + messageType=error）
+    if status in {"error", "interrupted"}:
+        err = payload.get("error_message") or payload.get("message") or payload.get("error") or "执行失败"
+        return _sse("answer", {"content": str(err), "messageType": "error"}).encode("utf-8")
+
+    return None
+
+
+async def run_common_chat(
+    *,
+    session,
+    query: str,
+    current_user,
+    chat_id: str | None = None,
+    msg_uuid: str | None = None,
+    model_spec: str | None = None,
+) -> AsyncIterator[bytes]:
+    """智能问答 - 使用通用对话Agent（SSE 流式输出）
+
+    对应 Ai-Chat-DB 的 COMMON_QA 模式
+    """
+    import uuid as uuid_module
+    chat_id = chat_id or str(uuid_module.uuid4())
+    uuid_str = msg_uuid or str(uuid_module.uuid4())
+
+    def make_chunk(data_type: str, data: dict) -> bytes:
+        return _sse(data_type, data).encode("utf-8")
+
+    try:
+        # 使用默认的 chatbot agent
+        agent_id = conf.default_agent_id or "ChatbotAgent"
+        agent = agent_manager.get_agent(agent_id)
+
+        # 构建请求参数
+        meta = {
+            "query": query,
+            "user_id": str(current_user.id),
+            "chat_id": chat_id,
+            "uuid": uuid_str,
+            "qa_type": "COMMON_QA",
+        }
+
+        answer_parts: list[str] = []
+
+        # 调用流式对话
+        async for raw in stream_agent_chat(
+            agent_id=agent_id,
+            query=query,
+            config={"thread_id": chat_id},
+            meta=meta,
+            image_content=None,
+            current_user=current_user,
+            db=session,
+        ):
+            sse_chunk = _agent_jsonl_bytes_to_sse(raw)
+            if sse_chunk:
+                # 仅累计 answer 内容用于落库
+                try:
+                    evt = json.loads(sse_chunk.decode("utf-8").removeprefix("data:").strip())
+                    if evt.get("dataType") == "answer" and isinstance(evt.get("data"), dict):
+                        answer_parts.append(str(evt["data"].get("content", "")))
+                except Exception:
+                    pass
+                yield sse_chunk
+
+        # 落库到 data_chat_records / data_chat_sessions（供左侧历史统一展示）
+        try:
+            from src.repositories.datasource_repository import DatasourceRepository
+
+            repo = DatasourceRepository(session)
+            await repo.create_chat_record(
+                {
+                    "user_id": str(current_user.id),
+                    "chat_id": chat_id,
+                    "message_id": uuid_str,
+                    "question": query,
+                    "answer": "".join(answer_parts),
+                    "datasource_id": None,
+                    "sql_statement": None,
+                    "query_result": None,
+                    "chart_config": None,
+                    "qa_type": "COMMON_QA",
+                }
+            )
+            await repo.upsert_chat_session(
+                user_id=str(current_user.id),
+                chat_id=chat_id,
+                qa_type="COMMON_QA",
+                title=(query or "新对话")[:255],
+                datasource_id=None,
+            )
+            await session.commit()
+        except Exception as e:
+            logger.warning(f"保存智能问答记录失败: {e}")
+
+    except Exception as e:
+        logger.error(f"智能问答执行失败: {e}, {traceback.format_exc()}")
+        yield make_chunk("answer", {"content": f"执行失败: {str(e)}", "messageType": "error"})
+
+    # 发送结束信号
+    yield make_chunk("stream_end", {"chat_id": chat_id})
+
+
+async def run_file_chat(
+    *,
+    session,
+    query: str,
+    user_id: str,
+    chat_id: str | None = None,
+    msg_uuid: str | None = None,
+    model_spec: str | None = None,
+    file_list: list | None = None,
+    current_user=None,
+) -> AsyncIterator[bytes]:
+    """表格问答 - 上传Excel文件进行分析（SSE 流式输出）
+
+    对应 Ai-Chat-DB 的 FILEDATA_QA 模式
+    复用 stream_agent_chat 实现文件分析
+    """
+    import uuid as uuid_module
+    from src.services import chat_stream_service
+
+    chat_id = chat_id or str(uuid_module.uuid4())
+    uuid_str = msg_uuid or str(uuid_module.uuid4())
+
+    def make_chunk(data_type: str, data: dict) -> bytes:
+        return _sse(data_type, data).encode("utf-8")
+
+    # 检查是否有文件
+    if not file_list or len(file_list) == 0:
+        yield make_chunk("answer", {"content": "请上传Excel文件后再提问", "messageType": "error"})
+        yield make_chunk("stream_end", {"chat_id": chat_id})
+        return
+
+    # 发送步骤进度：文件解析
+    yield make_chunk("step_progress", {
+        "type": "step_progress",
+        "step": "file_parser",
+        "stepName": "文件解析中...",
+        "status": "start",
+        "progressId": str(uuid.uuid4()),
+    })
+
+    try:
+        # 构建带有文件信息的查询
+        file_info = "\n".join([f"- {f.get('file_name', '未命名文件')}" for f in file_list])
+        enhanced_query = f"{query}\n\n附件文件:\n{file_info}"
+
+        # 构建请求参数
+        meta = {
+            "query": enhanced_query,
+            "user_id": str(current_user.id) if current_user else user_id,
+            "chat_id": chat_id,
+            "uuid": uuid_str,
+            "qa_type": "FILEDATA_QA",
+            "file_list": file_list,
+        }
+
+        # 发送文件解析完成
+        yield make_chunk("step_progress", {
+            "type": "step_progress",
+            "step": "file_parser",
+            "stepName": "文件解析完成",
+            "status": "complete",
+            "progressId": str(uuid.uuid4()),
+        })
+
+        answer_parts: list[str] = []
+
+        # 调用流式对话
+        async for raw in chat_stream_service.stream_agent_chat(
+            agent_id="ChatbotAgent",
+            query=enhanced_query,
+            config={"thread_id": chat_id},
+            meta=meta,
+            image_content=None,
+            current_user=current_user,
+            db=session,
+        ):
+            sse_chunk = _agent_jsonl_bytes_to_sse(raw)
+            if sse_chunk:
+                try:
+                    evt = json.loads(sse_chunk.decode("utf-8").removeprefix("data:").strip())
+                    if evt.get("dataType") == "answer" and isinstance(evt.get("data"), dict):
+                        answer_parts.append(str(evt["data"].get("content", "")))
+                except Exception:
+                    pass
+                yield sse_chunk
+
+        # 落库到 data_chat_records / data_chat_sessions
+        try:
+            import json as json_module
+            from src.repositories.datasource_repository import DatasourceRepository
+
+            repo = DatasourceRepository(session)
+            await repo.create_chat_record(
+                {
+                    "user_id": str(current_user.id) if current_user else str(user_id),
+                    "chat_id": chat_id,
+                    "message_id": uuid_str,
+                    "question": query,
+                    "answer": "".join(answer_parts),
+                    "datasource_id": None,
+                    "sql_statement": None,
+                    "query_result": None,
+                    "chart_config": None,
+                    "qa_type": "FILEDATA_QA",
+                    "file_key": json_module.dumps(file_list, ensure_ascii=False),
+                }
+            )
+            await repo.upsert_chat_session(
+                user_id=str(current_user.id) if current_user else str(user_id),
+                chat_id=chat_id,
+                qa_type="FILEDATA_QA",
+                title=(query or "新对话")[:255],
+                datasource_id=None,
+            )
+            await session.commit()
+        except Exception as e:
+            logger.warning(f"保存表格问答记录失败: {e}")
+
+    except Exception as e:
+        logger.error(f"表格问答执行失败: {e}, {traceback.format_exc()}")
+        yield make_chunk("answer", {"content": f"执行失败: {str(e)}", "messageType": "error"})
+
+    # 发送结束信号
+    yield make_chunk("stream_end", {"chat_id": chat_id})
+
+
+async def run_report_chat(
+    *,
+    session,
+    query: str,
+    datasource_id: int,
+    user_id: str | None = None,
+    chat_id: str | None = None,
+    msg_uuid: str | None = None,
+    model_spec: str | None = None,
+    current_user=None,
+) -> AsyncIterator[bytes]:
+    """深度问数 - 使用DeepAgent进行深度分析（SSE 流式输出）
+
+    对应 Ai-Chat-DB 的 REPORT_QA 模式
+    复用 stream_agent_chat 实现深度分析
+    """
+    import uuid as uuid_module
+    from src.services import chat_stream_service
+
+    chat_id = chat_id or str(uuid_module.uuid4())
+    uuid_str = msg_uuid or str(uuid_module.uuid4())
+
+    def make_chunk(data_type: str, data: dict) -> bytes:
+        return _sse(data_type, data).encode("utf-8")
+
+    # 检查是否有数据源
+    if not datasource_id:
+        yield make_chunk("answer", {"content": "请选择数据源后再提问", "messageType": "error"})
+        yield make_chunk("stream_end", {"chat_id": chat_id})
+        return
+
+    # 发送步骤进度：深度分析准备
+    yield make_chunk("step_progress", {
+        "type": "step_progress",
+        "step": "deep_analysis",
+        "stepName": "深度分析准备中...",
+        "status": "start",
+        "progressId": str(uuid.uuid4()),
+    })
+
+    try:
+        # 构建带有数据源信息的查询
+        enhanced_query = f"{query}\n\n数据源ID: {datasource_id}"
+
+        # 构建请求参数
+        meta = {
+            "query": enhanced_query,
+            "user_id": str(current_user.id) if current_user else user_id,
+            "chat_id": chat_id,
+            "uuid": uuid_str,
+            "qa_type": "REPORT_QA",
+            "datasource_id": datasource_id,
+        }
+
+        # 发送分析开始
+        yield make_chunk("step_progress", {
+            "type": "step_progress",
+            "step": "deep_analysis",
+            "stepName": "深度分析中...",
+            "status": "complete",
+            "progressId": str(uuid.uuid4()),
+        })
+
+        answer_parts: list[str] = []
+
+        # 调用流式对话 - 使用 DeepAgent
+        async for raw in chat_stream_service.stream_agent_chat(
+            agent_id="DeepAgent",
+            query=enhanced_query,
+            config={"thread_id": chat_id, "datasource_id": datasource_id},
+            meta=meta,
+            image_content=None,
+            current_user=current_user,
+            db=session,
+        ):
+            sse_chunk = _agent_jsonl_bytes_to_sse(raw)
+            if sse_chunk:
+                try:
+                    evt = json.loads(sse_chunk.decode("utf-8").removeprefix("data:").strip())
+                    if evt.get("dataType") == "answer" and isinstance(evt.get("data"), dict):
+                        answer_parts.append(str(evt["data"].get("content", "")))
+                except Exception:
+                    pass
+                yield sse_chunk
+
+        # 落库到 data_chat_records / data_chat_sessions
+        try:
+            from src.repositories.datasource_repository import DatasourceRepository
+
+            uid = str(current_user.id) if current_user else (user_id or "")
+            repo = DatasourceRepository(session)
+            await repo.create_chat_record(
+                {
+                    "user_id": uid,
+                    "chat_id": chat_id,
+                    "message_id": uuid_str,
+                    "question": query,
+                    "answer": "".join(answer_parts),
+                    "datasource_id": datasource_id,
+                    "sql_statement": None,
+                    "query_result": None,
+                    "chart_config": None,
+                    "qa_type": "REPORT_QA",
+                }
+            )
+            await repo.upsert_chat_session(
+                user_id=uid,
+                chat_id=chat_id,
+                qa_type="REPORT_QA",
+                title=(query or "新对话")[:255],
+                datasource_id=datasource_id,
+            )
+            await session.commit()
+        except Exception as e:
+            logger.warning(f"保存深度问数记录失败: {e}")
+
+    except Exception as e:
+        logger.error(f"深度问数执行失败: {e}, {traceback.format_exc()}")
+        yield make_chunk("answer", {"content": f"执行失败: {str(e)}", "messageType": "error"})
+
+    # 发送结束信号
+    yield make_chunk("stream_end", {"chat_id": chat_id})

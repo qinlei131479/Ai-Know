@@ -22,7 +22,7 @@ from src.data_chat.nodes.recommender import recommender
 from src.data_chat.nodes.schema_inspector import schema_inspector
 from src.data_chat.nodes.sql_executor import sql_executor
 from src.data_chat.nodes.sql_generator import sql_generator
-from src.data_chat.nodes.summarizer import summarizer
+from src.data_chat.nodes.summarizer import summarizer, summarizer_stream
 from src.data_chat.state import DataChatState
 from src.repositories.datasource_repository import DatasourceRepository
 from src.services.datasource_crypto import decrypt_datasource_config
@@ -254,7 +254,7 @@ async def run_data_chat(
         yield _sse_end(chat_id)
         return
 
-    # ── Step 4-6: 并行执行图表配置 + 数据总结 + 推荐问题 ──
+    # ── Step 4-6: 图表配置 + 推荐问题（并行） + 总结（流式） ──
     chart_pid = str(uuid.uuid4())
     summarizer_pid = str(uuid.uuid4())
     recommender_pid = str(uuid.uuid4())
@@ -263,19 +263,17 @@ async def run_data_chat(
     yield _sse_step("summarizer", "start", summarizer_pid)
     yield _sse_step("recommender", "start", recommender_pid)
 
-    # 并行执行三个任务
+    # 并行执行图表配置 + 推荐问题（这两个可以并行）
     async def _chart_task():
         return await chart_generator(state.copy(), llm=llm)
-
-    async def _summarizer_task():
-        return await summarizer(state.copy(), llm=llm)
 
     async def _recommender_task():
         return await recommender(state.copy(), llm=llm, ds_type=ds_type)
 
     try:
-        chart_result, summary_result, recommend_result = await asyncio.gather(
-            _chart_task(), _summarizer_task(), _recommender_task(),
+        # 并行运行图表和推荐任务
+        chart_result, recommend_result = await asyncio.gather(
+            _chart_task(), _recommender_task(),
             return_exceptions=True,
         )
 
@@ -285,11 +283,6 @@ async def run_data_chat(
         elif isinstance(chart_result, Exception):
             logger.error(f"chart_generator 异常: {chart_result}")
 
-        if isinstance(summary_result, dict):
-            state.update(summary_result)
-        elif isinstance(summary_result, Exception):
-            logger.error(f"summarizer 异常: {summary_result}")
-
         if isinstance(recommend_result, dict):
             state.update(recommend_result)
         elif isinstance(recommend_result, Exception):
@@ -298,18 +291,12 @@ async def run_data_chat(
     except Exception as e:
         logger.error(f"并行任务异常: {e}", exc_info=True)
 
+    # 图表和推荐任务完成后发送状态
     yield _sse_step("chart_generator", "complete", chart_pid)
-    yield _sse_step("summarizer", "complete", summarizer_pid)
     yield _sse_step("recommender", "complete", recommender_pid)
 
-    # ── 按顺序输出结果：总结 → 图表数据 → 推荐问题 ──
-
-    # 1. 数据总结
-    report_summary = state.get("report_summary")
-    if report_summary:
-        yield _sse_answer(report_summary)
-
-    # 2. 图表/表格数据
+    # ── 流式输出数据总结 ──
+    # 先输出图表/表格数据（此时已有数据）
     render_data = state.get("render_data")
     chart_config = state.get("chart_config")
     if render_data:
@@ -320,7 +307,25 @@ async def run_data_chat(
         }
         yield _sse_bus_data(bus_payload)
 
-    # 3. 推荐问题
+    # 流式输出总结内容
+    accumulated_summary = ""
+    try:
+        async for chunk_content, accumulated in summarizer_stream(state.copy(), llm=llm):
+            accumulated_summary = accumulated
+            # 实时输出每个 chunk
+            yield _sse_answer(chunk_content)
+    except Exception as e:
+        logger.error(f"流式总结异常: {e}", exc_info=True)
+        if accumulated_summary:
+            yield _sse_answer(accumulated_summary)
+        else:
+            yield _sse_answer("数据总结生成失败，请稍后重试")
+
+    # 标记总结完成
+    state["report_summary"] = accumulated_summary
+    yield _sse_step("summarizer", "complete", summarizer_pid)
+
+    # ── 输出推荐问题 ──
     recommended = state.get("recommended_questions")
     if recommended:
         yield _sse_bus_data({"recommended_questions": recommended})
@@ -341,18 +346,26 @@ async def _save_chat_record(
     """保存数据问答记录"""
     try:
         repo = DatasourceRepository(session)
+        question = state.get("user_query", "")
         await repo.create_chat_record({
             "user_id": user_id or "",
             "chat_id": chat_id,
             "message_id": message_id,
-            "question": state.get("user_query", ""),
+            "question": question,
             "answer": state.get("report_summary", ""),
             "datasource_id": state.get("datasource_id"),
             "sql_statement": state.get("generated_sql"),
             "query_result": state.get("render_data"),
             "chart_config": state.get("chart_config"),
-            "qa_type": "data",
+            "qa_type": "DATABASE_QA",
         })
+        await repo.upsert_chat_session(
+            user_id=user_id or "",
+            chat_id=chat_id,
+            qa_type="DATABASE_QA",
+            title=(question or "新对话")[:255],
+            datasource_id=state.get("datasource_id"),
+        )
         await session.commit()
     except Exception as e:
         logger.warning(f"保存对话记录失败: {e}")
@@ -398,7 +411,20 @@ async def list_chat_sessions(
     session: AsyncSession,
     user_id: str,
     limit: int = 20,
-) -> list[dict[str, Any]]:
-    """获取用户的数据问答对话列表"""
+    page: int = 1,
+    qa_type: str | None = None,
+    search_text: str | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """获取用户的数据问答对话列表（支持分页和搜索）
+
+    Returns:
+        tuple: (会话列表, 总数)
+    """
     repo = DatasourceRepository(session)
-    return await repo.list_chat_sessions(user_id, limit)
+    return await repo.list_chat_sessions(
+        user_id,
+        limit,
+        page=page,
+        qa_type=qa_type,
+        search_text=search_text
+    )

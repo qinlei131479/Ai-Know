@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from src.storage.postgres.models_datasource import (
     DataChatRecord,
+    DataChatSession,
     Datasource,
     DatasourceField,
     DatasourceTable,
@@ -186,6 +187,75 @@ class DatasourceRepository:
         await self.db.refresh(record)
         return record
 
+    async def upsert_chat_session(
+        self,
+        *,
+        user_id: str,
+        chat_id: str,
+        qa_type: str | None,
+        title: str | None = None,
+        datasource_id: int | None = None,
+    ) -> DataChatSession:
+        result = await self.db.execute(select(DataChatSession).where(DataChatSession.chat_id == chat_id))
+        session = result.scalar_one_or_none()
+        if session is None:
+            session = DataChatSession(
+                user_id=str(user_id),
+                chat_id=chat_id,
+                title=title,
+                datasource_id=datasource_id,
+                qa_type=qa_type,
+                status="active",
+            )
+            self.db.add(session)
+        else:
+            # 仅在首次创建时用问题做标题；后续不覆盖用户重命名的 title
+            if session.title in (None, "", "新对话") and title:
+                session.title = title
+            if datasource_id is not None:
+                session.datasource_id = datasource_id
+            if qa_type is not None:
+                session.qa_type = qa_type
+            session.updated_at = utc_now_naive()
+            if session.status == "deleted":
+                session.status = "active"
+
+        await self.db.flush()
+        await self.db.refresh(session)
+        return session
+
+    async def rename_chat_session(self, *, user_id: str, chat_id: str, title: str) -> bool:
+        result = await self.db.execute(
+            select(DataChatSession).where(
+                DataChatSession.chat_id == chat_id,
+                DataChatSession.user_id == str(user_id),
+                DataChatSession.status == "active",
+            )
+        )
+        session = result.scalar_one_or_none()
+        if session is None:
+            return False
+        session.title = str(title).strip()[:255]
+        session.updated_at = utc_now_naive()
+        await self.db.flush()
+        return True
+
+    async def delete_chat_session(self, *, user_id: str, chat_id: str) -> bool:
+        result = await self.db.execute(
+            select(DataChatSession).where(
+                DataChatSession.chat_id == chat_id,
+                DataChatSession.user_id == str(user_id),
+                DataChatSession.status == "active",
+            )
+        )
+        session = result.scalar_one_or_none()
+        if session is None:
+            return False
+        session.status = "deleted"
+        session.updated_at = utc_now_naive()
+        await self.db.flush()
+        return True
+
     async def list_chat_records(
         self, user_id: str, chat_id: str | None = None, limit: int = 50,
     ) -> list[DataChatRecord]:
@@ -196,30 +266,58 @@ class DatasourceRepository:
         result = await self.db.execute(query)
         return list(result.scalars().all())
 
-    async def list_chat_sessions(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
-        """获取用户的对话列表（按 chat_id 分组，取最新一条）"""
+    async def list_chat_sessions(
+        self,
+        user_id: str,
+        limit: int = 50,
+        page: int = 1,
+        qa_type: str | None = None,
+        search_text: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """获取用户的对话列表（支持分页、问答模式过滤、搜索、重命名/删除）
+
+        Args:
+            user_id: 用户ID
+            limit: 每页数量
+            page: 页码
+            qa_type: 问答模式过滤
+            search_text: 搜索关键词
+
+        Returns:
+            tuple: (会话列表, 总数)
+        """
         from sqlalchemy import func
 
-        subq = (
-            select(
-                DataChatRecord.chat_id,
-                func.max(DataChatRecord.created_at).label("last_time"),
-                func.min(DataChatRecord.question).label("first_question"),
-                func.max(DataChatRecord.datasource_id).label("datasource_id"),
-            )
-            .where(DataChatRecord.user_id == user_id)
-            .group_by(DataChatRecord.chat_id)
-            .order_by(func.max(DataChatRecord.created_at).desc())
-            .limit(limit)
-            .subquery()
+        query = select(DataChatSession).where(
+            DataChatSession.user_id == str(user_id),
+            DataChatSession.status == "active",
         )
-        result = await self.db.execute(select(subq))
-        return [
+
+        if qa_type:
+            query = query.where(DataChatSession.qa_type == qa_type)
+
+        if search_text:
+            query = query.where(DataChatSession.title.ilike(f"%{search_text}%"))
+
+        # 总数
+        count_query = select(func.count()).select_from(query.subquery())
+        count_result = await self.db.execute(count_query)
+        total = int(count_result.scalar() or 0)
+
+        offset = (page - 1) * limit
+        query = query.order_by(DataChatSession.updated_at.desc()).limit(limit).offset(offset)
+
+        result = await self.db.execute(query)
+        items = list(result.scalars().all())
+        sessions = [
             {
-                "chat_id": row.chat_id,
-                "last_time": str(row.last_time),
-                "first_question": row.first_question,
-                "datasource_id": row.datasource_id,
+                "chat_id": s.chat_id,
+                "last_time": str(s.updated_at or s.created_at),
+                "title": s.title,
+                "datasource_id": s.datasource_id,
+                "qa_type": s.qa_type,
             }
-            for row in result.all()
+            for s in items
         ]
+
+        return sessions, total

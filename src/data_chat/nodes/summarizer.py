@@ -2,6 +2,7 @@
 
 import json
 import re
+from collections.abc import AsyncGenerator
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -30,8 +31,42 @@ def _remove_code_blocks(text: str) -> str:
     return text.strip()
 
 
+async def summarizer_stream(
+    state: DataChatState, *, llm
+) -> AsyncGenerator[tuple[str, str], None]:
+    """流式生成数据总结，逐块返回内容
+
+    Yields:
+        tuple[str, str]: (chunk_content, full_summary_so_far)
+    """
+    execution_result = state.get("execution_result")
+    if not execution_result or not execution_result.success or not execution_result.data:
+        return
+
+    try:
+        data_str = json.dumps(execution_result.data, ensure_ascii=False, indent=2, cls=_DecimalEncoder)
+
+        system_prompt, user_prompt = prompt_builder.build_summarizer_prompt(
+            data_result=data_str,
+            user_query=state.get("user_query", ""),
+        )
+
+        messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+
+        accumulated = ""
+        async for chunk in llm.astream(messages):
+            content = chunk.content if hasattr(chunk, "content") else str(chunk)
+            accumulated += content
+            yield content, _remove_code_blocks(accumulated)
+
+        logger.info("数据总结流式生成完成")
+    except Exception as e:
+        logger.error(f"数据总结流式生成异常: {e}", exc_info=True)
+        yield f"数据总结生成失败: {e}", ""
+
+
 async def summarizer(state: DataChatState, *, llm) -> DataChatState:
-    """数据总结节点"""
+    """数据总结节点（非流式版本，保持向后兼容）"""
     execution_result = state.get("execution_result")
     if not execution_result or not execution_result.success or not execution_result.data:
         state["report_summary"] = None

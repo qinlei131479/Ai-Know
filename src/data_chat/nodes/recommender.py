@@ -44,7 +44,8 @@ async def recommender(state: DataChatState, *, llm, ds_type: str = "mysql") -> D
 
         logger.info(f"推荐问题生成成功: {len(state['recommended_questions'])} 个")
     except Exception as e:
-        logger.error(f"推荐问题生成异常: {e}", exc_info=True)
+        logger.error(f"推荐问题生成异常: {e}")
+        logger.exception("详细堆栈:")
         state["recommended_questions"] = []
 
     return state

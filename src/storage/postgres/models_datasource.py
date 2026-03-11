@@ -233,3 +233,32 @@ class DataChatRecord(Base):
             "file_key": self.file_key,
             "created_at": format_utc_datetime(self.created_at),
         }
+
+
+class DataChatSession(Base):
+    """问答会话（用于左侧历史列表、重命名、删除）"""
+
+    __tablename__ = "data_chat_sessions"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(String(64), nullable=False, index=True, comment="用户ID")
+    chat_id = Column(String(100), nullable=False, unique=True, index=True, comment="对话ID")
+    title = Column(String(255), nullable=True, comment="会话标题（可重命名）")
+    datasource_id = Column(
+        Integer, ForeignKey("datasources.id", ondelete="SET NULL"), nullable=True, index=True, comment="数据源ID"
+    )
+    qa_type = Column(String(50), nullable=True, index=True, comment="问答类型: COMMON_QA/DATABASE_QA/FILEDATA_QA/REPORT_QA")
+    status = Column(String(20), nullable=False, default="active", index=True, comment="状态: active, deleted")
+    created_at = Column(DateTime, default=utc_now_naive, index=True, comment="创建时间")
+    updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive, index=True, comment="更新时间")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chat_id": self.chat_id,
+            "title": self.title,
+            "datasource_id": self.datasource_id,
+            "qa_type": self.qa_type,
+            "status": self.status,
+            "created_at": format_utc_datetime(self.created_at),
+            "updated_at": format_utc_datetime(self.updated_at),
+        }

@@ -58,9 +58,9 @@ const fetchGithubStars = async () => {
   try {
     isLoadingStars.value = true
     // 公共API，可以直接使用fetch
-    const response = await fetch('https://api.github.com/repos/xerrors/Yuxi-Know')
-    const data = await response.json()
-    githubStars.value = data.stargazers_count
+    // const response = await fetch('https://api.github.com/repos/xerrors/Yuxi-Know')
+    // const data = await response.json()
+    // githubStars.value = data.stargazers_count
   } catch (error) {
     console.error('获取GitHub stars失败:', error)
   } finally {
