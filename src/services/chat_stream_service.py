@@ -3,13 +3,13 @@ import json
 import traceback
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import UTC, datetime
+from typing import Any
 
 from langchain.messages import AIMessage, AIMessageChunk, HumanMessage
 from langgraph.types import Command
 
 from src import config as conf
-from src import knowledge_base
 from src.agents import agent_manager
 from src.plugins.guard import content_guard
 from src.repositories.agent_config_repository import AgentConfigRepository
@@ -41,7 +41,7 @@ def _build_state_files(attachments: list[dict]) -> dict:
         if not file_path or not markdown:
             continue
 
-        now = datetime.utcnow().isoformat() + "+00:00"
+        now = datetime.now(UTC).isoformat()
         # 将 markdown 内容按行拆分
         content_lines = markdown.split("\n")
         files[file_path] = {
@@ -194,6 +194,112 @@ async def save_messages_from_langgraph_state(
         logger.error(traceback.format_exc())
 
 
+def _extract_interrupt_info(state) -> Any | None:
+    """从 LangGraph state 中提取中断信息"""
+    if hasattr(state, "tasks") and state.tasks:
+        for task in state.tasks:
+            if hasattr(task, "interrupts") and task.interrupts:
+                return task.interrupts[0]
+
+    interrupt_data = state.values.get("__interrupt__")
+    if isinstance(interrupt_data, list) and interrupt_data:
+        return interrupt_data[0]
+
+    return None
+
+
+def _coerce_interrupt_payload(info: Any) -> dict:
+    """将 LangGraph interrupt 对象转换为 dict 结构。"""
+    if isinstance(info, dict):
+        return info
+
+    payload = getattr(info, "value", None)
+    if isinstance(payload, dict):
+        return payload
+
+    question = getattr(info, "question", None)
+    operation = getattr(info, "operation", None)
+    result: dict[str, Any] = {}
+    if isinstance(question, str) and question.strip():
+        result["question"] = question
+    if isinstance(operation, str) and operation.strip():
+        result["operation"] = operation
+    return result
+
+
+def _normalize_interrupt_options(raw_options: Any) -> list[dict[str, str]]:
+    if not isinstance(raw_options, list):
+        return []
+
+    options: list[dict[str, str]] = []
+    for item in raw_options:
+        if isinstance(item, dict):
+            label = str(item.get("label") or item.get("value") or "").strip()
+            value = str(item.get("value") or item.get("label") or "").strip()
+        else:
+            label = str(item).strip()
+            value = label
+        if label and value:
+            options.append({"label": label, "value": value})
+    return options
+
+
+def _build_ask_user_question_payload(info: Any, thread_id: str) -> dict[str, Any]:
+    """将 interrupt 信息标准化为 ask_user_question_required 载荷。"""
+    payload = _coerce_interrupt_payload(info)
+
+    question = str(payload.get("question") or "请选择一个选项").strip()
+    question_id = str(payload.get("question_id") or uuid.uuid4())
+    source = str(payload.get("source") or payload.get("tool_name") or "interrupt")
+    multi_select = bool(payload.get("multi_select", False))
+    allow_other = bool(payload.get("allow_other", True))
+    operation = payload.get("operation")
+
+    options = _normalize_interrupt_options(payload.get("options"))
+
+    return {
+        "question_id": question_id,
+        "question": question,
+        "options": options,
+        "multi_select": multi_select,
+        "allow_other": allow_other,
+        "source": source,
+        "operation": operation if isinstance(operation, str) else "",
+        "thread_id": thread_id,
+    }
+
+
+def _ensure_full_msg(full_msg: AIMessage | None, accumulated_content: list[str]) -> AIMessage | None:
+    """如果 full_msg 为空且有累积内容，构建 AIMessage"""
+    if not full_msg and accumulated_content:
+        return AIMessage(content="".join(accumulated_content))
+    return full_msg
+
+
+async def _resolve_agent_config(
+    db, agent_id: str, department_id, user_id: str, agent_config_id: int | str | None
+) -> tuple:
+    """解析 agent_config，返回 (config_item, agent_config_id)"""
+    config_repo = AgentConfigRepository(db)
+    config_item = None
+    if agent_config_id is not None:
+        try:
+            config_item = await config_repo.get_by_id(int(agent_config_id))
+        except Exception:
+            logger.warning(f"Failed to fetch agent config {agent_config_id}: {traceback.format_exc()}")
+            config_item = None
+        if config_item is not None and (config_item.department_id != department_id or config_item.agent_id != agent_id):
+            config_item = None
+
+    if config_item is None:
+        config_item = await config_repo.get_or_create_default(
+            department_id=department_id, agent_id=agent_id, created_by=user_id
+        )
+        agent_config_id = config_item.id
+
+    return config_item, agent_config_id
+
+
 async def check_and_handle_interrupts(
     agent,
     langgraph_config: dict,
@@ -208,35 +314,11 @@ async def check_and_handle_interrupts(
         if not state or not state.values:
             return
 
-        interrupt_info = None
-
-        if hasattr(state, "tasks") and state.tasks:
-            for task in state.tasks:
-                if hasattr(task, "interrupts") and task.interrupts:
-                    interrupt_info = task.interrupts[0]
-                    break
-
-        if not interrupt_info and state.values:
-            interrupt_data = state.values.get("__interrupt__")
-            if interrupt_data and isinstance(interrupt_data, list) and len(interrupt_data) > 0:
-                interrupt_info = interrupt_data[0]
-
+        interrupt_info = _extract_interrupt_info(state)
         if interrupt_info:
-            question = "是否批准以下操作？"
-            operation = "需要人工审批的操作"
-            if isinstance(interrupt_info, dict):
-                question = interrupt_info.get("question", question)
-                operation = interrupt_info.get("operation", operation)
-            elif hasattr(interrupt_info, "question"):
-                question = getattr(interrupt_info, "question", question)
-                operation = getattr(interrupt_info, "operation", operation)
-
-            meta["interrupt"] = {
-                "question": question,
-                "operation": operation,
-                "thread_id": thread_id,
-            }
-            yield make_chunk(status="interrupted", message=question, meta=meta)
+            question_payload = _build_ask_user_question_payload(interrupt_info, thread_id)
+            meta["interrupt"] = question_payload
+            yield make_chunk(status="ask_user_question_required", meta=meta, **question_payload)
 
     except Exception as e:
         logger.error(f"Error checking interrupts: {e}")
@@ -311,22 +393,7 @@ async def stream_agent_chat(
         return
 
     agent_config_id = config.get("agent_config_id")
-    config_repo = AgentConfigRepository(db)
-    config_item = None
-    if agent_config_id is not None:
-        try:
-            config_item = await config_repo.get_by_id(int(agent_config_id))
-        except Exception:
-            logger.warning(f"Failed to fetch agent config {agent_config_id}: {traceback.format_exc()}")
-            config_item = None
-        if config_item is not None and (config_item.department_id != department_id or config_item.agent_id != agent_id):
-            config_item = None
-
-    if config_item is None:
-        config_item = await config_repo.get_or_create_default(
-            department_id=department_id, agent_id=agent_id, created_by=user_id
-        )
-        agent_config_id = config_item.id
+    config_item, agent_config_id = await _resolve_agent_config(db, agent_id, department_id, user_id, agent_config_id)
 
     if not (thread_id := config.get("thread_id")):
         thread_id = str(uuid.uuid4())
@@ -340,6 +407,8 @@ async def stream_agent_chat(
         "agent_config_id": agent_config_id,
         "agent_config": agent_config,
     }
+    full_msg = None
+    accumulated_content: list[str] = []
 
     try:
         conv_repo = ConversationRepository(db)
@@ -358,28 +427,6 @@ async def stream_agent_chat(
 
         # 先构建 langgraph_config
         langgraph_config = {"configurable": {"thread_id": thread_id, "user_id": user_id}}
-
-        # 注意：LangGraph 会自动从 checkpointer 恢复 state（包括 attachments 和 files）
-        # 无需手动加载或传递
-
-        # 根据用户权限过滤知识库
-        requested_knowledge_names = input_context["agent_config"].get("knowledges")
-        logger.info(f"Requesting knowledges: {requested_knowledge_names}")
-        if requested_knowledge_names and isinstance(requested_knowledge_names, list) and requested_knowledge_names:
-            user_info = {"role": "user", "department_id": department_id}
-            accessible_databases = await knowledge_base.get_databases_by_user(user_info)
-            accessible_kb_names = {
-                db.get("name")
-                for db in accessible_databases.get("databases", [])
-                if isinstance(db, dict) and db.get("name")
-            }
-            logger.info(f"Accessible knowledges: {accessible_kb_names}")
-
-            filtered_knowledge_names = [kb for kb in requested_knowledge_names if kb in accessible_kb_names]
-            blocked_knowledge_names = [kb for kb in requested_knowledge_names if kb not in accessible_kb_names]
-            if blocked_knowledge_names:
-                logger.warning(f"用户 {user_id} 无权访问知识库: {blocked_knowledge_names}, 已自动过滤")
-            input_context["agent_config"]["knowledges"] = filtered_knowledge_names
 
         full_msg = None
         accumulated_content = []
@@ -410,8 +457,7 @@ async def stream_agent_chat(
                 except Exception as e:
                     logger.error(f"Error processing tool message: {e}")
 
-        if not full_msg and accumulated_content:
-            full_msg = AIMessage(content="".join(accumulated_content))
+        full_msg = _ensure_full_msg(full_msg, accumulated_content)
 
         if conf.enable_content_guard and hasattr(full_msg, "content") and await content_guard.check(full_msg.content):
             await save_partial_message(conv_repo, thread_id, full_msg, "content_guard_blocked")
@@ -448,8 +494,7 @@ async def stream_agent_chat(
 
         async def save_cleanup():
             nonlocal full_msg
-            if not full_msg and accumulated_content:
-                full_msg = AIMessage(content="".join(accumulated_content))
+            full_msg = _ensure_full_msg(full_msg, accumulated_content)
 
             async with pg_manager.get_async_session_context() as new_db:
                 new_conv_repo = ConversationRepository(new_db)
@@ -477,8 +522,7 @@ async def stream_agent_chat(
         error_msg = f"Error streaming messages: {e}"
         error_type = "unexpected_error"
 
-        if not full_msg and accumulated_content:
-            full_msg = AIMessage(content="".join(accumulated_content))
+        full_msg = _ensure_full_msg(full_msg, accumulated_content)
 
         async with pg_manager.get_async_session_context() as new_db:
             new_conv_repo = ConversationRepository(new_db)
@@ -497,7 +541,7 @@ async def stream_agent_resume(
     *,
     agent_id: str,
     thread_id: str,
-    approved: bool,
+    resume_input: Any,
     meta: dict,
     config: dict,
     current_user,
@@ -523,10 +567,10 @@ async def stream_agent_resume(
         )
         return
 
-    init_msg = {"type": "system", "content": f"Resume with approved: {approved}"}
+    init_msg = {"type": "system", "content": f"Resume with input: {resume_input}"}
     yield make_resume_chunk(status="init", meta=meta, msg=init_msg)
 
-    resume_command = Command(resume=approved)
+    resume_command = Command(resume=resume_input)
     graph = await agent.get_graph()
 
     user_id = str(current_user.id)
@@ -538,22 +582,7 @@ async def stream_agent_resume(
         return
 
     agent_config_id = (config or {}).get("agent_config_id")
-    config_repo = AgentConfigRepository(db)
-    config_item = None
-    if agent_config_id is not None:
-        try:
-            config_item = await config_repo.get_by_id(int(agent_config_id))
-        except Exception:
-            logger.warning(f"Failed to fetch agent config {agent_config_id}: {traceback.format_exc()}")
-            config_item = None
-        if config_item is not None and (config_item.department_id != department_id or config_item.agent_id != agent_id):
-            config_item = None
-
-    if config_item is None:
-        config_item = await config_repo.get_or_create_default(
-            department_id=department_id, agent_id=agent_id, created_by=user_id
-        )
-        agent_config_id = config_item.id
+    config_item, agent_config_id = await _resolve_agent_config(db, agent_id, department_id, user_id, agent_config_id)
 
     input_context = {
         "user_id": user_id,

@@ -14,6 +14,8 @@ export * from './department_api' // 部门管理API
 export * from './datasource_api' // 数据源管理API
 export * from './data_chat_api' // 数据问答API
 export * from './mcp_api' // MCP API
+export * from './skill_api' // Skills API
+export * from './tool_api' // 工具 API
 
 // 导出基础工具函数
 export {
